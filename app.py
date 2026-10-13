@@ -24,12 +24,14 @@ st.set_page_config(
 
 st.title("☀️ Automated AI-Based Solar & Building Energy Management System")
 st.markdown(
-    "Select a date and time. The app fetches automated weather data, predicts solar generation and building load using your ML models, and simulates energy management."
+    "Select a date and time. The app fetches live weather forecasts from Open-Meteo, predicts solar generation and building load using your ML models, and simulates energy management."
 )
 
 # Sidebar Inputs (Date & Time)
 st.sidebar.header("📅 Select Target Date & Time")
-selected_date = st.sidebar.date_input("Target Date", datetime.date.today())
+selected_date = st.sidebar.date_input(
+    "Target Date", datetime.date.today()
+)
 selected_time = st.sidebar.time_input("Target Time", datetime.time(12, 0))
 
 target_datetime = datetime.datetime.combine(selected_date, selected_time)
@@ -44,45 +46,91 @@ battery_soc = st.sidebar.slider(
 )
 
 
-# Fetch Weather Function (Using your OpenWeather API Key)
-def get_automated_weather():
-  api_key = "6QXrIi39XS1LCJ0q4Sit"  # Replace with your key
-  # Default coordinates for testing (e.g., Konstanz, Germany as used in your dataset)
-  lat, lon = 47.66, 9.17
-  url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}&units=metric"
+# Fetch Real Weather from Open-Meteo API
+@st.cache_data(ttl=3600)  # Cache for 1 hour to prevent redundant requests
+def fetch_open_meteo_weather(target_dt):
+  # Coordinates matching your setup
+  lat, lon = 6.583, 79.963
+  url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,relative_humidity_2m,precipitation,cloud_cover,shortwave_radiation,wind_speed_10m&timezone=UTC&forecast_days=7"
 
   try:
     response = requests.get(url, timeout=5)
     if response.status_code == 200:
       data = response.json()
-      temp = data["main"]["temp"]
-      humidity = data["main"]["humidity"]
-      wind_speed = data["wind"]["speed"]
-      clouds = data["clouds"]["all"]
-      direct_irr = max(0.0, 800.0 * (1 - clouds / 100.0))
-      diffuse_irr = max(0.0, 200.0 * (clouds / 100.0))
-      sun_height = 45.0 if 6 <= hour <= 18 else -10.0
-      return temp, humidity, wind_speed, direct_irr, diffuse_irr, sun_height
+      hourly = data["hourly"]
+      times = hourly["time"]  # List of ISO timestamp strings
+
+      # Format target datetime into Open-Meteo's hourly string format (e.g., "2026-10-13T12:00")
+      target_str = target_dt.strftime("%Y-%m-%dT%H:00")
+
+      if target_str in times:
+        idx = times.index(target_str)
+        temp = hourly["temperature_2m"][idx]
+        humidity = hourly["relative_humidity_2m"][idx]
+        precip = hourly["precipitation"][idx]
+        clouds = hourly["cloud_cover"][idx]
+        shortwave_rad = hourly["shortwave_radiation"][idx]
+        wind_speed = hourly["wind_speed_10m"][idx]
+
+        # Map to your model features
+        direct_irr = max(
+            0.0, shortwave_rad * 0.75
+        )  # Approximate direct split
+        diffuse_irr = max(
+            0.0, shortwave_rad * 0.25
+        )  # Approximate diffuse split
+        sun_height = 90.0 * np.sin(np.pi * (hour - 6) / 12) if 6 <= hour <= 18 else -10.0
+        return (
+            temp,
+            humidity,
+            wind_speed,
+            precip,
+            direct_irr,
+            diffuse_irr,
+            sun_height,
+            True,
+        )
   except Exception:
     pass
 
-  # Fallback weather if offline or key error
-  temp = 25.0
-  humidity = 75.0
-  wind_speed = 3.2
+  # Fallback if API fails or date is out of 7-day range
+  temp = 28.0
+  humidity = 80.0
+  wind_speed = 3.5
+  precip = 0.0
   direct_irr = 600.0 if 6 <= hour <= 18 else 0.0
-  diffuse_irr = 100.0 if 6 <= hour <= 18 else 0.0
+  diffuse_irr = 150.0 if 6 <= hour <= 18 else 0.0
   sun_height = 45.0 if 6 <= hour <= 18 else -10.0
-  return temp, humidity, wind_speed, direct_irr, diffuse_irr, sun_height
+  return (
+      temp,
+      humidity,
+      wind_speed,
+      precip,
+      direct_irr,
+      diffuse_irr,
+      sun_height,
+      False,
+  )
 
 
-temp, humidity, wind_speed, direct_irr, diffuse_irr, sun_height = (
-    get_automated_weather()
+# Fetch weather data
+(
+    temp,
+    humidity,
+    wind_speed,
+    precip,
+    direct_irr,
+    diffuse_irr,
+    sun_height,
+    is_live,
+) = fetch_open_meteo_weather(target_datetime)
+
+status_badge = (
+    "🟢 Live Open-Meteo Data" if is_live else "🟡 Estimated / Fallback Data"
 )
-
 st.info(
-    f"🌐 **Weather Fetched for {target_datetime.strftime('%Y-%m-%d %H:%M')}** | "
-    f"Temp: {temp:.1f}°C | Direct Irradiance: {direct_irr:.1f} W/m² | Wind: {wind_speed} m/s"
+    f"🌐 **Weather Status: {status_badge} for {target_datetime.strftime('%Y-%m-%d %H:%M')}** | "
+    f"Temp: {temp:.1f}°C | Radiation: {direct_irr + diffuse_irr:.1f} W/m² | Wind: {wind_speed} m/s"
 )
 
 # 1. Solar Prediction using solar_model.pkl
@@ -91,7 +139,7 @@ solar_input_df = pd.DataFrame(
         temp,
         humidity,
         wind_speed,
-        0.0,
+        precip,
         direct_irr,
         diffuse_irr,
         sun_height,
@@ -115,7 +163,7 @@ solar_input_df = pd.DataFrame(
 predicted_solar = float(solar_model.predict(solar_input_df)[0])
 predicted_solar = max(0.0, predicted_solar)
 
-# 2. Load Prediction using load_model.pkl (Using rolling average historical lags as proxies)
+# 2. Load Prediction using load_model.pkl
 load_input_df = pd.DataFrame(
     [[hour, dayofweek, month, 1500.0, 1450.0, 1550.0]],
     columns=[
@@ -176,14 +224,12 @@ st.success(f"**Recommended Dispatch Decision:** {ems_action}")
 # Maintenance Alerting
 st.divider()
 st.subheader("🛠️ Condition-Based Maintenance (CBM) Alerting")
-actual_observed_solar = (
-    predicted_solar * 0.80
-)  # Simulated 20% soiling reduction
+actual_observed_solar = predicted_solar * 0.80
 performance_ratio = (
     (actual_observed_solar / predicted_solar) * 100 if predicted_solar > 0 else 100
 )
 
-if performance_ratio < 85.0 and direct_irr > 300:
+if performance_ratio < 85.0 and (direct_irr + diffuse_irr) > 300:
   st.warning(
       "⚠️ **[Maintenance Alert Triggered]**: Actual solar generation is sustained >15% below model expectations under high irradiance. **Recommended Action:** Inspect panels for soiling or shading."
   )
