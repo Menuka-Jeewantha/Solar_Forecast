@@ -45,16 +45,27 @@ st.title(
     "☀️ AI-Based Solar & Building Energy Management System (Sri Lanka Time)"
 )
 st.markdown(
-    "Select your **local date and time in Sri Lanka (GMT+5:30)**. The app fetches live weather, dynamically retrieves historical load patterns for accurate lag features, and predicts building demand and solar generation."
+    "Select your **local date and time in Sri Lanka (GMT+5:30)** and your **Solar Panel Area**. The app fetches live weather including rain/precipitation, scales solar output based on your system size, and simulates energy management."
 )
 
-# Sidebar Inputs (Local Date & Time in Sri Lanka)
-st.sidebar.header("📅 Select Local Date & Time (Sri Lanka)")
+# Sidebar Inputs (Local Date, Time & Panel Area)
+st.sidebar.header("📅 Simulation Parameters")
 selected_date = st.sidebar.date_input(
     "Target Date", datetime.date.today()
 )
 selected_time = st.sidebar.time_input(
     "Target Local Time", datetime.time(14, 0)
+)
+
+# New User Input: Solar Panel Area in square meters (m²)
+# Formula reference: Prated = A_module * eta_STC * 1000 W/m² (Assuming 20% efficiency -> 1 m² = 0.2 kWp)
+module_area = st.sidebar.number_input(
+    "Solar Panel Area (m²)",
+    min_value=1.0,
+    max_value=100.0,
+    value=10.0,
+    step=1.0,
+    help="Enter total rooftop module area. Assumes standard 20% module efficiency.",
 )
 
 local_datetime = datetime.datetime.combine(selected_date, selected_time)
@@ -72,7 +83,7 @@ battery_soc = st.sidebar.slider(
 )
 
 
-# Fetch Real Weather from Open-Meteo
+# Fetch Real Weather & Precipitation from Open-Meteo
 @st.cache_data(ttl=3600)
 def fetch_open_meteo_weather(target_utc_dt):
   lat, lon = 6.583, 79.963  # Kalutara, Sri Lanka coordinates
@@ -148,10 +159,14 @@ status_badge = (
 )
 st.info(
     f"🇱🇰 **Local Time: {local_datetime.strftime('%Y-%m-%d %H:%M')} (Sri Lanka)** | Status: {status_badge} | "
-    f"Temp: {temp:.1f}°C | Radiation: {direct_irr + diffuse_irr:.1f} W/m²"
+    f"Temp: {temp:.1f}°C | Rain/Precipitation: {precip:.1f} mm/h | Wind: {wind_speed} m/s"
 )
 
-# 1. Solar Prediction
+# 1. Solar Prediction for 1 kWp model, then scaled by user's panel area
+# Assuming 20% module efficiency: 1 m² area produces 0.2 kWp capacity rated at STC (1000 W/m²)
+module_efficiency = 0.20
+rated_capacity_kwp = (module_area * module_efficiency)  # e.g., 10 m² = 2 kWp
+
 solar_input_df = pd.DataFrame(
     [[
         temp,
@@ -178,10 +193,15 @@ solar_input_df = pd.DataFrame(
         "dayofyear",
     ],
 )
-predicted_solar = float(solar_model.predict(solar_input_df)[0])
-predicted_solar = max(0.0, predicted_solar)
 
-# 2. Dynamic Load Prediction (Extracting actual historical lag patterns based on hour & day type)
+# Base prediction for 1 kWp system
+predicted_solar_1kwp = float(solar_model.predict(solar_input_df)[0])
+predicted_solar_1kwp = max(0.0, predicted_solar_1kwp)
+
+# Scale by user's system rated capacity (kWp)
+predicted_solar = predicted_solar_1kwp * rated_capacity_kwp
+
+# 2. Dynamic Load Prediction
 matching_hours = df_load_sub[
     (df_load_sub["utc_timestamp"].dt.hour == local_hour)
     & (df_load_sub["utc_timestamp"].dt.dayofweek == dayofweek)
@@ -206,7 +226,6 @@ load_input_df = pd.DataFrame(
     ],
 )
 predicted_load = float(load_model.predict(load_input_df)[0])
-# Add temperature sensitivity so load varies realistically with weather changes
 predicted_load += (temp - 25.0) * 25.0
 predicted_load = max(100.0, predicted_load)
 
@@ -216,7 +235,7 @@ net_load = predicted_load - predicted_solar
 col1, col2, col3 = st.columns(3)
 with col1:
   st.metric(
-      label="☀️ Predicted Solar PV Generation",
+      label=f"☀️ Predicted Solar Generation ({module_area} m² / {rated_capacity_kwp:.1f} kWp)",
       value=f"{predicted_solar:.2f} W",
   )
 with col2:
@@ -253,15 +272,21 @@ else:
 
 st.success(f"**Recommended Dispatch Decision:** {ems_action}")
 
-# Maintenance Alerting
+# Maintenance Alerting (incorporating precipitation/rain check)
 st.divider()
 st.subheader("🛠️ Condition-Based Maintenance (CBM) Alerting")
-actual_observed_solar = predicted_solar * 0.80
+actual_observed_solar = predicted_solar * (
+    0.75 if precip > 0 else 0.85
+)  # Lower output during rain/clouds
 performance_ratio = (
     (actual_observed_solar / predicted_solar) * 100 if predicted_solar > 0 else 100
 )
 
-if performance_ratio < 85.0 and (direct_irr + diffuse_irr) > 300:
+if precip > 0:
+  st.info(
+      f"🌧️ **Rain Detected ({precip:.1f} mm/h)**: Solar reduction is due to active rainfall/cloud cover rather than a fault. System operating normally."
+  )
+elif performance_ratio < 85.0 and (direct_irr + diffuse_irr) > 300:
   st.warning(
       "⚠️ **[Maintenance Alert Triggered]**: Actual solar generation is sustained >15% below model expectations under high irradiance. **Recommended Action:** Inspect panels for soiling or shading."
   )
